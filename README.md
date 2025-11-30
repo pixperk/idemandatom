@@ -93,6 +93,28 @@ Server starting on port 8080
 | REDIS_PASSWORD | (empty) | Redis password |
 | PORT | 8080 | HTTP server port |
 
+## Load Test
+
+Send 100 concurrent orders:
+
+```bash
+go run test_orders.go
+```
+
+Output:
+```
+[0] 200: {"status": "success", "order_id": "..."}
+[1] 200: {"status": "success", "order_id": "..."}
+...
+
+--- Summary ---
+Total: 100 orders
+Success: 100
+Failed: 0
+Duration: 245ms
+Rate: 408.16 orders/sec
+```
+
 ## Files
 
 - `main.go` - HTTP server, handlers, DB/Redis connections
@@ -100,3 +122,4 @@ Server starting on port 8080
 - `consumer.go` - Redis pub/sub email consumer
 - `script.lua` - Idempotency Lua script for Redis
 - `init.sql` - Database schema
+- `test_orders.go` - Load test script
