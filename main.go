@@ -187,6 +187,12 @@ func main() {
 	}
 	defer rdb.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go StartOutboxWorker(ctx, db, rdb)
+	log.Println("Outbox worker started")
+
 	http.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
