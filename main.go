@@ -3,15 +3,21 @@ package main
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
+
+//go:embed script.lua
+var luaScript string
 
 type Order struct {
 	ID     uuid.UUID `json:"id"`
@@ -94,6 +100,73 @@ func ConnectDB() (*sql.DB, error) {
 	return nil, fmt.Errorf("failed to connect to database after retries")
 }
 
+func ConnectRedis() (*redis.Client, error) {
+	addr := getEnv("REDIS_ADDR", "localhost:6379")
+	password := getEnv("REDIS_PASSWORD", "")
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       0,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for i := 0; i < 5; i++ {
+		if err := rdb.Ping(ctx).Err(); err == nil {
+			log.Println("Connected to Redis successfully")
+			return rdb, nil
+		}
+		log.Printf("Waiting for Redis... attempt %d/5", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	return nil, fmt.Errorf("failed to connect to Redis after retries")
+}
+
+func HandleCreateOrder(w http.ResponseWriter, r *http.Request, db *sql.DB, rdb *redis.Client) {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		http.Error(w, "Missing Idempotency-Key", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	val, err := rdb.Eval(ctx, luaScript, []string{idempotencyKey}, "PENDING", 60).Result()
+
+	if err != nil && err != redis.Nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if val == "PENDING" {
+		http.Error(w, "Request is processing, please retry shortly", http.StatusConflict)
+		return
+	}
+
+	if val != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf("%v", val)))
+		return
+	}
+
+	orderID := uuid.New()
+	order := Order{ID: orderID, UserID: uuid.New(), Amount: 1000}
+
+	if err := CreateOrder(ctx, db, order); err != nil {
+		rdb.Del(ctx, idempotencyKey)
+		http.Error(w, "Transaction failed", http.StatusInternalServerError)
+		return
+	}
+
+	response := fmt.Sprintf(`{"status": "success", "order_id": "%s"}`, orderID)
+	rdb.Set(ctx, idempotencyKey, response, 24*time.Hour)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(response))
+}
+
 func getEnv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -108,5 +181,21 @@ func main() {
 	}
 	defer db.Close()
 
-	log.Println("Application started")
+	rdb, err := ConnectRedis()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rdb.Close()
+
+	http.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		HandleCreateOrder(w, r, db, rdb)
+	})
+
+	port := getEnv("PORT", "8080")
+	log.Printf("Server starting on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
